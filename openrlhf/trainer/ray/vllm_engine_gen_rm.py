@@ -17,8 +17,13 @@ def get_all_env_variables():
 
 
 @ray.remote
-class LLMRayActor:
-    def __init__(self, *args, **kwargs):
+class LLMGenRMRayActor:
+    def __init__(self, template: str,
+                 n: int,
+                 temperature: float,
+                 top_p: float,
+                 max_tokens: int,
+                 *args, **kwargs):
         import vllm
 
         self.__version__ = vllm.__version__
@@ -51,19 +56,30 @@ class LLMRayActor:
 
                 RayWorkerWrapperPath.RayWorkerWrapper = RayWorkerWrapper
 
+        self.template = template
         self.llm = vllm.LLM(*args, **kwargs)
+        self.sampling_params = vllm.sampling_params.SamplingParams(
+            n=n,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+        )
 
-    def generate(self, *args, **kwargs):
+    def generate(self, queries, auxiliary, *args, **kwargs):
+        prompts = []
+        for question, resp in zip(auxiliary["questions"], auxiliary["responses"]):
+            prompts.append(self.template.replace("[[Question]]", question).replace("[[Thinking]]", resp))
+
         return self.llm.generate(*args, **kwargs)
 
-    def init_process_group(self, master_address, master_port, rank_offset, world_size, group_name, backend, use_ray):
+    def init_process_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):
         if self.use_gpu_executor:
             return self.llm.llm_engine.model_executor.driver_worker.init_process_group(
-                master_address, master_port, rank_offset, world_size, group_name, backend, use_ray
+                master_address, master_port, rank_offset, world_size, group_name, backend
             )
         else:
             return self.llm.llm_engine.model_executor._run_workers(
-                "init_process_group", master_address, master_port, rank_offset, world_size, group_name, backend, use_ray
+                "init_process_group", master_address, master_port, rank_offset, world_size, group_name, backend
             )
 
     def update_weight(self, name, dtype, shape, empty_cache=False):
@@ -82,14 +98,14 @@ class LLMRayActor:
 
 
 def create_vllm_engines(
-    num_engines: int,
-    tensor_parallel_size: int,
-    pretrain: str,
-    seed: int,
-    enable_prefix_caching: bool,
-    enforce_eager: bool,
-    max_model_len: int,
-    max_num_seqs=None,
+        num_engines: int,
+        tensor_parallel_size: int,
+        pretrain: str,
+        seed: int,
+        enable_prefix_caching: bool,
+        enforce_eager: bool,
+        max_model_len: int,
+        gen_rm_template: str,
 ):
     vllm_engines = []
     # RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES will always be set in current context,
@@ -112,7 +128,7 @@ def create_vllm_engines(
             )
 
         vllm_engines.append(
-            LLMRayActor.options(
+            LLMGenRMRayActor.options(
                 num_cpus=1,
                 num_gpus=num_gpus,
                 scheduling_strategy=scheduling_strategy,
@@ -126,7 +142,6 @@ def create_vllm_engines(
                 enable_prefix_caching=enable_prefix_caching,
                 enforce_eager=enforce_eager,
                 max_model_len=max_model_len,
-                max_num_seqs=max_num_seqs,
             )
         )
 
@@ -134,6 +149,6 @@ def create_vllm_engines(
 
 
 if __name__ == "__main__":
-    llm = LLMRayActor.remote("meta-llama/Llama-2-7b-chat-hf", tensor_parallel_size=4)
+    llm = LLMGenRMRayActor.remote("meta-llama/Llama-2-7b-chat-hf", tensor_parallel_size=4)
     output = ray.get(llm.generate.remote("San Franciso is a"))
     print(f"output: {output}")

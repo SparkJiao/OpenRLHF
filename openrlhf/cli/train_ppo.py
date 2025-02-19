@@ -79,16 +79,13 @@ def train(args):
     tokenizer = get_tokenizer(args.pretrain, actor.model, "left", strategy, use_fast=not args.disable_fast_tokenizer)
 
     # load weights for reference actor
-    if args.init_kl_coef == 0:
-        initial_model = None
-    else:
-        initial_model = Actor(
-            args.pretrain,
-            use_flash_attention_2=args.flash_attn,
-            bf16=args.bf16,
-            load_in_4bit=args.load_in_4bit,
-            ds_config=strategy.get_ds_eval_config(offload=False),
-        )
+    initial_model = Actor(
+        args.pretrain,
+        use_flash_attention_2=args.flash_attn,
+        bf16=args.bf16,
+        load_in_4bit=args.load_in_4bit,
+        ds_config=strategy.get_ds_eval_config(offload=False),
+    )
 
     if args.enable_ema:
         ema_model = Actor(
@@ -265,8 +262,6 @@ def train(args):
         eos_token_id=tokenizer.eos_token_id,
         # remote reward model
         remote_rm_url=args.remote_rm_url,
-        save_hf_ckpt=args.save_hf_ckpt,
-        disable_ds_ckpt=args.disable_ds_ckpt,
     )
 
     trainer.fit(args, prompts_dataloader, pretrain_dataloader, consumed_samples, num_update_steps_per_episodes)
@@ -291,8 +286,6 @@ if __name__ == "__main__":
     # Checkpoint
     parser.add_argument("--save_path", type=str, default="./ckpt")
     parser.add_argument("--save_steps", type=int, default=-1)
-    parser.add_argument("--save_hf_ckpt", action="store_true", default=False)
-    parser.add_argument("--disable_ds_ckpt", action="store_true", default=False)
     parser.add_argument("--logging_steps", type=int, default=1)
     parser.add_argument("--eval_steps", type=int, default=-1)
     parser.add_argument("--ckpt_path", type=str, default="./ckpt/checkpoints_ppo")
@@ -364,9 +357,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--advantage_estimator",
         type=str,
-        choices=["gae", "reinforce", "rloo", "reinforce_baseline"],
+        choices=["gae", "reinforce", "rloo"],
         default="gae",
-        help="Choose advantage estimation method: gae, reinforce, rloo, reinforce_baseline",
+        help="Choose advantage estimation method: gae, reinforce, rloo",
     )
 
     # LoRA
@@ -420,9 +413,6 @@ if __name__ == "__main__":
     # TensorBoard parameters
     parser.add_argument("--use_tensorboard", type=str, default=None, help="TensorBoard logging path")
 
-    # ModelScope parameters
-    parser.add_argument("--use_ms", action="store_true", default=False)
-
     args = parser.parse_args()
 
     if args.advantage_estimator not in ["gae"]:
@@ -433,8 +423,8 @@ if __name__ == "__main__":
         else:
             args.critic_pretrain = args.pretrain
 
-    if args.advantage_estimator in ["rloo", "reinforce_baseline"]:
-        assert args.n_samples_per_prompt > 1, "RLOO/REINFORCE++-baseline requires n_samples_per_prompt > 1"
+    if args.advantage_estimator == "rloo":
+        assert args.n_samples_per_prompt > 1, "RLOO requires n_samples_per_prompt > 1"
 
     if args.input_template and "{}" not in args.input_template:
         print("[Warning] {} not in args.input_template, set to None")
@@ -445,11 +435,5 @@ if __name__ == "__main__":
             "[Warning] input_template contains \\n chracters instead of newline. "
             "You likely want to pass $'\\n' in Bash or \"`n\" in PowerShell."
         )
-
-    if args.use_ms:
-        from modelscope.utils.hf_util import patch_hub
-
-        # Patch hub to download models from modelscope to speed up.
-        patch_hub()
 
     train(args)

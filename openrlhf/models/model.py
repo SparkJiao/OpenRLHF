@@ -20,23 +20,23 @@ logger = init_logger(__name__)
 # Construct transformer with a value head for sequence classification.
 # https://github.com/huggingface/transformers/blob/405b56269812056d9593869e22b7b264d806cb1e/src/transformers/models/llama/modeling_llama.py#L1254
 def get_llm_for_sequence_regression(
-    model_name_or_path: str,
-    model_type: str,
-    *,
-    bf16=True,
-    load_in_4bit=False,
-    lora_rank=0,
-    lora_alpha=16,
-    target_modules=None,
-    lora_dropout=0,
-    normalize_reward=False,
-    use_flash_attention_2=False,
-    ds_config: dict = None,
-    init_value_head: bool = False,
-    value_head_prefix="score",
-    device_map=None,
-    packing_samples=False,
-    **kwargs,
+        model_name_or_path: str,
+        model_type: str,
+        *,
+        bf16=True,
+        load_in_4bit=False,
+        lora_rank=0,
+        lora_alpha=16,
+        target_modules=None,
+        lora_dropout=0,
+        normalize_reward=False,
+        use_flash_attention_2=False,
+        ds_config: dict = None,
+        init_value_head: bool = False,
+        value_head_prefix="score",
+        device_map=None,
+        packing_samples=False,
+        **kwargs,
 ) -> nn.Module:
     """Retrieve a transformer model with a sequence regression head on top.
 
@@ -63,7 +63,7 @@ def get_llm_for_sequence_regression(
         nn.Module: A pretrained transformer model with a sequence regression head.
     """
     assert (
-        model_type == "critic" or model_type == "reward"
+            model_type == "critic" or model_type == "reward" or model_type == "format_reward"
     ), f"invalid model_type: {model_type}, should be critic or reward."
 
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
@@ -78,6 +78,8 @@ def get_llm_for_sequence_regression(
     base_pretrained_class = base_class.__base__
     if model_type == "reward":
         cls_class = _get_reward_model(base_pretrained_class, base_class, value_head_prefix, packing_samples)
+    elif model_type == "format_reward":
+        cls_class = _get_format_reward_model(base_pretrained_class, base_class, value_head_prefix, packing_samples)
     else:
         cls_class = _get_critic_model(base_pretrained_class, base_class, value_head_prefix, packing_samples)
 
@@ -180,12 +182,12 @@ def _get_reward_model(base_pretrained_model, base_llm_model, value_head_prefix="
                 self.std[0] = config.std
 
         def forward(
-            self,
-            input_ids: torch.LongTensor = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            return_output=False,
-            ring_attn_group=None,
-            packed_seq_lens=None,
+                self,
+                input_ids: torch.LongTensor = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                return_output=False,
+                ring_attn_group=None,
+                packed_seq_lens=None,
         ) -> torch.Tensor:
             if not self.packing_samples:
                 # https://github.com/OpenRLHF/OpenRLHF/issues/217
@@ -229,6 +231,90 @@ def _get_reward_model(base_pretrained_model, base_llm_model, value_head_prefix="
     return RewardModel
 
 
+def _get_format_reward_model(base_pretrained_model, base_llm_model, value_head_prefix="score", packing_samples=False):
+    class RewardModel(base_pretrained_model):
+        supports_gradient_checkpointing = True
+
+        def __init__(self, config: AutoConfig, rm_coef: float = 1.0):
+            super().__init__(config)
+            setattr(self, self.base_model_prefix, base_llm_model(config))
+
+            self.value_head_prefix = value_head_prefix
+            setattr(self, value_head_prefix, nn.Linear(config.hidden_size, config.num_labels, bias=False))
+
+            self.packing_samples = packing_samples
+
+            self.rm_coef = rm_coef
+
+            # mean std
+            self.normalize_reward = config.normalize_reward
+            self.register_buffer("mean", torch.zeros(1), persistent=False)
+            self.register_buffer("std", torch.ones(1), persistent=False)
+
+            # load mean/std from config.json
+            if hasattr(config, "mean"):
+                self.mean[0] = config.mean
+                self.std[0] = config.std
+
+        def forward(
+                self,
+                input_ids: torch.LongTensor = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                return_output=False,
+                ring_attn_group=None,
+                packed_seq_lens=None,
+        ) -> torch.Tensor:
+            if not self.packing_samples:
+                # https://github.com/OpenRLHF/OpenRLHF/issues/217
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 1)
+            else:
+                # convert attention_mask to position_ids
+                if ring_attn_group is not None:
+                    input_ids, attention_mask, position_ids = convert_ring_attn_params(
+                        input_ids, attention_mask, packed_seq_lens, ring_attn_group
+                    )
+                else:
+                    position_ids = reset_position_ids(attention_mask)
+                # explicitly ignore attention_mask for packing_samples
+                attention_mask = None
+
+            outputs = getattr(self, self.base_model_prefix)(
+                input_ids, attention_mask=attention_mask, position_ids=position_ids
+            )
+            last_hidden_states = outputs["last_hidden_state"]
+            values = getattr(self, self.value_head_prefix)(last_hidden_states).squeeze(-1)
+
+            if self.packing_samples:
+                if ring_attn_group is not None:
+                    reward = all_gather(values, ring_attn_group).reshape(1, -1)
+                else:
+                    reward = values
+                # TODO: convert packed_seq_lens into torch tensor in advance
+                # TODO: @ Fangkai: We do not remove eos token here.
+                packed_seq_lens = torch.tensor(packed_seq_lens, device=values.device)
+                eos_indices = packed_seq_lens.cumsum(dim=0) - 1
+                reward = reward.squeeze(0).gather(dim=0, index=eos_indices)
+            else:
+                # attention_mask[input_ids.eq(self.config.eos_token_id)] = 0
+                # Avoid in-place modification
+                attention_mask = attention_mask.clone()
+                attention_mask[input_ids.eq(self.config.eos_token_id)] = 0
+                eos_indices = attention_mask.size(1) - 1 - attention_mask.long().fliplr().argmax(dim=1, keepdim=True)
+                # reward = values.gather(dim=1, index=eos_indices).squeeze(1)
+                reward = values[torch.arange(attention_mask.size(0), device=values.device), eos_indices.squeeze(1)]
+                reward = torch.sigmoid(reward).mean(dim=-1)
+
+            if not self.training and self.normalize_reward:
+                reward = (reward - self.mean) / self.std
+
+            reward = reward * self.rm_coef
+
+            return (reward, outputs) if return_output else reward
+
+    return RewardModel
+
+
 def _get_critic_model(base_pretrained_model, base_llm_model, value_head_prefix="score", packing_samples=False):
     class CriticModel(base_pretrained_model):
         supports_gradient_checkpointing = True
@@ -253,12 +339,12 @@ def _get_critic_model(base_pretrained_model, base_llm_model, value_head_prefix="
                 self.std[0] = config.std
 
         def forward(
-            self,
-            input_ids: torch.LongTensor = None,
-            num_actions: Optional[Union[int, list[int]]] = None,
-            attention_mask: Optional[torch.Tensor] = None,
-            return_output=False,
-            packed_seq_lens=None,
+                self,
+                input_ids: torch.LongTensor = None,
+                num_actions: Optional[Union[int, list[int]]] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                return_output=False,
+                packed_seq_lens=None,
         ) -> torch.Tensor:
             if not self.packing_samples:
                 # https://github.com/OpenRLHF/OpenRLHF/issues/217

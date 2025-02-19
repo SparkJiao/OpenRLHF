@@ -9,9 +9,9 @@ from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from openrlhf.models import Actor, get_llm_for_sequence_regression
-from openrlhf.trainer.ray.utils import ray_noset_visible_devices
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 
+from openrlhf.trainer.ray.utils import ray_noset_visible_devices
 
 class DistributedTorchRayActor:
     def __init__(self, world_size, rank, master_addr, master_port):
@@ -107,9 +107,16 @@ class ReferenceModelRayActor(BasePPORole):
 class RewardModelRayActor(BasePPORole):
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain):
         self._setup_distributed(strategy)
+        model_type=getattr(strategy.args, "reward_model_type", "reward")
+        if model_type == "format_reward":
+            kwargs = {
+                "rm_coef": strategy.args.rm_coef,
+            }
+        else:
+            kwargs = {}
         model = get_llm_for_sequence_regression(
             pretrain,
-            "reward",
+            model_type,  # @Fangkai: add argument # "reward",
             normalize_reward=strategy.args.normalize_reward,
             use_flash_attention_2=strategy.args.flash_attn,
             bf16=strategy.args.bf16,
@@ -117,8 +124,10 @@ class RewardModelRayActor(BasePPORole):
             ds_config=strategy.get_ds_eval_config(offload=strategy.args.ref_reward_offload),
             value_head_prefix=strategy.args.value_head_prefix,
             packing_samples=strategy.args.packing_samples,
+            **kwargs,
         )
         strategy.print(model)
+        strategy.print("reward model type: {}".format(getattr(strategy.args, "reward_model_type", "reward")))
         strategy.print("reward normalization status: {}".format(strategy.args.normalize_reward))
         strategy.print("mean: {}, std {}".format(model.mean, model.std))
 
@@ -180,13 +189,15 @@ class PPORayActorGroup:
 
         # Use placement group to lock resources for models of same type
         if self._num_gpus_per_node > 1 and pg is None:
-            bundles = [{"GPU": 1, "CPU": 1} for _ in range(self._num_nodes * self._num_gpus_per_node)]
+            bundles = [
+                {"GPU": self._num_gpus_per_node, "CPU": self._num_gpus_per_node} for _ in range(self._num_nodes)
+            ]
             if self._resources:
                 resources_name = list(self._resources.keys())[0]
                 for i in range(len(bundles)):
                     bundles[i][resources_name] = self._num_resources_per_node
 
-            pg = placement_group(bundles, strategy="PACK")
+            pg = placement_group(bundles, strategy="STRICT_SPREAD")
             ray.get(pg.ready())
         if pg:
             master_actor = self.ray_actor_type.options(
@@ -216,7 +227,7 @@ class PPORayActorGroup:
                         resources=self._resources,
                         scheduling_strategy=PlacementGroupSchedulingStrategy(
                             placement_group=pg,
-                            placement_group_bundle_index=rank,
+                            placement_group_bundle_index=rank // self._num_gpus_per_node,
                         ),
                     ).remote(world_size, rank, master_addr, master_port)
                 else:
@@ -278,7 +289,9 @@ class PPORayActorGroup:
             initial_actor = initial_actors[i % len(initial_actors)] if initial_actors else None
 
             reward_actors = []
-            if not remote_rm_urls:
+            # if not remote_rm_urls:
+            # @Fangkai: Support coupled reward model and remote rm urls
+            if reward_model_groups is not None and len(reward_model_groups):
                 for reward_model_group in reward_model_groups:
                     actors = reward_model_group._actor_handlers
                     reward_actors.append(actors[i % len(actors)])

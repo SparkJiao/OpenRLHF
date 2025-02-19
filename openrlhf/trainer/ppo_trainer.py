@@ -8,9 +8,10 @@ import torch.nn as nn
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import time
 
 from openrlhf.models import Actor, GPTLMLoss, PolicyLoss, ValueLoss
-from openrlhf.models.utils import masked_mean
+from openrlhf.models.utils import masked_mean, compute_approx_kl, unpacking_samples, safe_masked_mean
 from openrlhf.utils.distributed_sampler import DistributedSampler
 
 from .ppo_utils import AdaptiveKLController, Experience, FixedKLController, NaiveExperienceMaker, NaiveReplayBuffer
@@ -50,55 +51,49 @@ class PPOTrainer(ABC):
         dataloader_pin_memory (bool, defaults to True): If True, pins memory in the data loader.
         remote_rm_url (str, optional): URL for remote reward model API.
         reward_fn (Callable, optional): Custom reward function for computing rewards.
-        save_hf_ckpt (bool): Whether to save huggingface-format model weight.
-        disable_ds_ckpt (bool): Whether not to save deepspeed-format model weight. (Deepspeed model weight is used for training recovery)
         **generate_kwargs: Additional arguments for model generation.
     """
 
     def __init__(
-        self,
-        strategy,
-        actor: Actor,
-        critic: nn.Module,
-        reward_model: nn.Module,
-        initial_model: Actor,
-        ema_model: Actor,
-        actor_optim: Optimizer,
-        critic_optim: Optimizer,
-        actor_scheduler,
-        critic_scheduler,
-        ema_beta: float = 0.992,
-        init_kl_coef: float = 0.001,
-        kl_target: float = None,
-        kl_horizon: int = 10000,
-        ptx_coef: float = 0,
-        micro_train_batch_size: int = 8,
-        buffer_limit: int = 0,
-        buffer_cpu_offload: bool = True,
-        eps_clip: float = 0.2,
-        value_clip: float = 0.2,
-        micro_rollout_batch_size: int = 8,
-        gradient_checkpointing: bool = False,
-        max_epochs: int = 1,
-        max_norm: float = 1.0,
-        tokenizer: Optional[Callable[[Any], dict]] = None,
-        prompt_max_len: int = 128,
-        dataloader_pin_memory: bool = True,
-        remote_rm_url: str = None,
-        reward_fn: Callable[[List[torch.Tensor]], torch.Tensor] = None,
-        save_hf_ckpt: bool = False,
-        disable_ds_ckpt: bool = False,
-        **generate_kwargs,
+            self,
+            strategy,
+            actor: Actor,
+            critic: nn.Module,
+            reward_model: nn.Module,
+            initial_model: Actor,
+            ema_model: Actor,
+            actor_optim: Optimizer,
+            critic_optim: Optimizer,
+            actor_scheduler,
+            critic_scheduler,
+            ema_beta: float = 0.992,
+            init_kl_coef: float = 0.001,
+            kl_target: float = None,
+            kl_horizon: int = 10000,
+            ptx_coef: float = 0,
+            micro_train_batch_size: int = 8,
+            buffer_limit: int = 0,
+            buffer_cpu_offload: bool = True,
+            eps_clip: float = 0.2,
+            value_clip: float = 0.2,
+            micro_rollout_batch_size: int = 8,
+            gradient_checkpointing: bool = False,
+            max_epochs: int = 1,
+            max_norm: float = 1.0,
+            tokenizer: Optional[Callable[[Any], dict]] = None,
+            prompt_max_len: int = 128,
+            dataloader_pin_memory: bool = True,
+            remote_rm_url: str = None,
+            reward_fn: Callable[[List[torch.Tensor]], torch.Tensor] = None,
+            **generate_kwargs,
     ) -> None:
         assert (
-            not isinstance(reward_model, List) or len(reward_model) == 1 or reward_fn is not None
+                not isinstance(reward_model, List) or len(reward_model) == 1 or reward_fn is not None
         ), "reward_fn must be specified if using multiple reward models"
 
         super().__init__()
         self.strategy = strategy
         self.args = strategy.args
-        self.save_hf_ckpt = save_hf_ckpt
-        self.disable_ds_ckpt = disable_ds_ckpt
         self.micro_rollout_batch_size = micro_rollout_batch_size
         self.max_epochs = max_epochs
         self.tokenizer = tokenizer
@@ -187,19 +182,19 @@ class PPOTrainer(ABC):
             self._tensorboard = SummaryWriter(log_dir=log_dir)
 
     def fit(
-        self,
-        args,
-        prompts_dataloader,
-        pretrain_dataloader,
-        consumed_samples=0,
-        num_update_steps_per_episodes=1,
+            self,
+            args,
+            prompts_dataloader,
+            pretrain_dataloader,
+            consumed_samples=0,
+            num_update_steps_per_episodes=1,
     ) -> None:
         num_rollouts_per_episodes = (
-            num_update_steps_per_episodes
-            * args.train_batch_size
-            // args.max_epochs
-            // args.rollout_batch_size
-            // args.n_samples_per_prompt
+                num_update_steps_per_episodes
+                * args.train_batch_size
+                // args.max_epochs
+                // args.rollout_batch_size
+                // args.n_samples_per_prompt
         )
 
         # get eval and save steps
@@ -229,7 +224,7 @@ class PPOTrainer(ABC):
 
             for rand_prompts in self.prompts_dataloader:
                 for i, experience in enumerate(
-                    self.experience_maker.make_experience_list(rand_prompts, **self.generate_kwargs)
+                        self.experience_maker.make_experience_list(rand_prompts, **self.generate_kwargs)
                 ):
                     if i == 0:
                         output = self.tokenizer.batch_decode(
@@ -238,9 +233,16 @@ class PPOTrainer(ABC):
                         self.strategy.print(output)
                     self.replay_buffer.append(experience)
 
-                self.replay_buffer.normalize("advantages", self.strategy)
+                torch.cuda.empty_cache()
+                if not getattr(args, "no_advantage_norm", False):  # Added by Fangkai: Original GRPO does not requires normalizations of advantages
+                    time_start = time.time()
+                    self.replay_buffer.normalize("advantages", self.strategy)
+                    time_end = time.time()
+                    self.strategy.print(f"Normalize time: {time_end - time_start}")
+
                 status = self.ppo_train(steps)
                 self.replay_buffer.clear()
+                torch.cuda.empty_cache()
 
                 if "kl" in status:
                     self.kl_ctl.update(status["kl"], args.rollout_batch_size * args.n_samples_per_prompt)
@@ -259,7 +261,6 @@ class PPOTrainer(ABC):
             self._tensorboard.close()
 
     def ppo_train(self, global_steps=0):
-        torch.cuda.empty_cache()
         # replay buffer may be empty at first, we should rebuild at each training
         dataloader = DataLoader(
             self.replay_buffer,
@@ -287,7 +288,7 @@ class PPOTrainer(ABC):
                 # weighted mean for kl
                 if "kl" in status:
                     status["kl"] *= status["response_length"]
-                    status = self.strategy.all_reduce(status)
+                    status = self.strategy.all_reduce(status)  # @Fangkai: When using 64 GPUs, all_reduce will cause timeout.
                     status["kl"] /= status["response_length"]
 
                 short_status = {}
@@ -301,6 +302,8 @@ class PPOTrainer(ABC):
                         "tlen": status["total_length"],
                         "kl": status["kl"],
                         "act_lr": status["actor_lr"],
+                        "max_glen": status["max_response_length"],
+                        "min_glen": status["min_response_length"],
                     }
 
                 if "critic_loss" in status:
@@ -321,7 +324,6 @@ class PPOTrainer(ABC):
                     status_mean[k] += v
             for k in status_mean.keys():
                 status_mean[k] /= len(status_list)
-        torch.cuda.empty_cache()
         return status_mean
 
     def training_step(self, experience: Experience, global_steps) -> Dict[str, float]:
@@ -362,19 +364,52 @@ class PPOTrainer(ABC):
             packed_seq_lens=packed_seq_lens,
         )
 
+        _actor_loss_kwargs = {}
+        if self.args.drop_truncated:
+            _actor_loss_kwargs["reduction"] = "none"
+
         # loss function
         actor_loss = self.actor_loss_fn(
             action_log_probs,
             old_action_log_probs,
             advantages,
             action_mask=experience.action_mask,
+            **_actor_loss_kwargs,
         )
+
+        if self.args.drop_truncated:
+            is_full = experience.info["is_full"]
+            actor_loss = safe_masked_mean(actor_loss, is_full, dim=-1)
+
         # mixtral
         if self.aux_loss:
             aux_loss = output.aux_loss
         else:
             aux_loss = 0
         loss = actor_loss + aux_loss * self.args.aux_loss_coef
+
+        if self.args.advantage_estimator in ["group_norm_vanilla", "pg"]:
+            if self.initial_model is not None:
+                kl = compute_approx_kl(
+                    action_log_probs,
+                    experience.ref_action_log_probs,
+                    experience.action_mask,
+                    use_kl_estimator_k3=self.args.use_kl_estimator_k3,
+                )
+            else:
+                kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device=action_log_probs.device)
+
+            if not self.strategy.args.packing_samples:
+                kl_mean = masked_mean(kl, experience.action_mask, dim=-1).mean()
+            else:
+                device = torch.cuda.current_device()
+                # convert tensor into list of tensors so that it's easier to manipulate
+                # within dataset.
+                kl = unpacking_samples(kl, num_actions)
+                kl_mean = torch.tensor([each_kl.mean() for each_kl in kl], device=device).mean()
+
+            loss = self.kl_ctl.value * kl_mean + loss
+
         self.strategy.backward(loss, self.actor, self.actor_optim)
 
         # ptx loss
@@ -403,17 +438,23 @@ class PPOTrainer(ABC):
 
         self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
         if self.ema_model:
-            self.strategy.moving_average(self.actor, self.ema_model, self.ema_beta, "cuda")
+            self.strategy.moving_average(self.actor, self.ema_model, self.ema_beta, "cpu")
 
         # status
         status = {"policy_loss": actor_loss.item(), "actor_lr": self.actor_scheduler.get_last_lr()[0]}
         if self.pretrain_dataloader is not None:
             status["ptx_loss"] = ptx_loss.item()
         for k, v in experience.info.items():
-            if k == "kl":
+            if k == "kl":  # TODO: @Fangkai - Do I need to update the kl-info here? I think this status will affect the scheduling of adaptive kl.
                 status[k] = (
-                    (v * experience.info["response_length"]).sum() / experience.info["response_length"].sum()
+                        (v * experience.info["response_length"]).sum() / experience.info["response_length"].sum()
                 ).item()
+            elif k == "response_length":
+                status[k] = v.mean().item()
+                status["max_response_length"] = v.max().item()
+                status["min_response_length"] = v.min().item()
+            elif k == "is_full":
+                status[k] = v.sum().item() / v.numel()
             else:
                 status[k] = v.mean().item()
         return status
@@ -504,20 +545,15 @@ class PPOTrainer(ABC):
             self._save_checkpoint(args, tag, client_states)
 
     def _save_checkpoint(self, args, tag, client_states):
-        if not self.disable_ds_ckpt:
+        self.strategy.save_ckpt(
+            self.actor.model,
+            os.path.join(args.ckpt_path, "_actor"),
+            tag,
+            args.max_ckpt_num,
+            args.max_ckpt_mem,
+            client_states,
+        )
+        if self.critic is not None:
             self.strategy.save_ckpt(
-                self.actor.model,
-                os.path.join(args.ckpt_path, "_actor"),
-                tag,
-                args.max_ckpt_num,
-                args.max_ckpt_mem,
-                client_states,
+                self.critic, os.path.join(args.ckpt_path, "_critic"), tag, args.max_ckpt_num, args.max_ckpt_mem
             )
-            if self.critic is not None:
-                self.strategy.save_ckpt(
-                    self.critic, os.path.join(args.ckpt_path, "_critic"), tag, args.max_ckpt_num, args.max_ckpt_mem
-                )
-
-        if self.save_hf_ckpt:
-            save_path = os.path.join(args.ckpt_path, f"{tag}_hf")
-            self.strategy.save_model(self.actor, self.tokenizer, save_path)

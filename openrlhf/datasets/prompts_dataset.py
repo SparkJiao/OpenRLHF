@@ -1,5 +1,6 @@
 from torch.utils.data import Dataset
 from tqdm import tqdm
+import json
 
 
 def preprocess_data(data, input_template=None, input_key="input", apply_chat_template=None) -> str:
@@ -26,11 +27,11 @@ class PromptDataset(Dataset):
     """
 
     def __init__(
-        self,
-        dataset,
-        tokenizer,
-        strategy,
-        input_template=None,
+            self,
+            dataset,
+            tokenizer,
+            strategy,
+            input_template=None,
     ) -> None:
         super().__init__()
         self.strategy = strategy
@@ -55,3 +56,41 @@ class PromptDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.prompts[idx]
+
+
+_common_model_template = {
+    "qwen2-math": "<|im_start|>system\nPlease reason step by step, and put your final answer within \\boxed{}.<|im_end|>\n"
+                  "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n",
+}
+
+
+class PromptLabelDataset(Dataset):
+    def __init__(self,
+                 file_path,
+                 tokenizer,
+                 strategy,
+                 input_template=None):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.strategy = strategy
+
+        self.data = json.load(open(file_path, "r"))
+        self.input_template = _common_model_template[input_template]
+
+        new_data = []
+        for item in self.data:
+            input_key = getattr(self.strategy.args, "question_key", "prompt")
+            prompt = self.input_template.replace("{prompt}", item[input_key])
+            label_key = getattr(self.strategy.args, "label_key", "label")
+            new_data.append({
+                "prompt": prompt,
+                "question": item[input_key],
+                "label": item[label_key],
+            })
+        self.data = new_data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]

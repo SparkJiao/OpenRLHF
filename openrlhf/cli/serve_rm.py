@@ -45,7 +45,7 @@ class RewardModelProxy:
         self.max_length = args.max_len
         self.batch_size = args.batch_size
 
-    def get_reward(self, queries, prompts):
+    def get_reward(self, queries):
         if self.batch_size is None:
             batch_size = len(queries)
         else:
@@ -101,16 +101,7 @@ if __name__ == "__main__":
     parser.add_argument("--disable_fast_tokenizer", action="store_true", default=False)
     parser.add_argument("--batch_size", type=int, default=None)
 
-    # ModelScope parameters
-    parser.add_argument("--use_ms", action="store_true", default=False)
-
     args = parser.parse_args()
-
-    if args.use_ms:
-        from modelscope.utils.hf_util import patch_hub
-
-        # Patch hub to download models from modelscope to speed up.
-        patch_hub()
 
     # server
     reward_model = RewardModelProxy(args)
@@ -120,8 +111,7 @@ if __name__ == "__main__":
     async def get_reward(request: Request):
         data = await request.json()
         queries = data.get("query")
-        prompts = data.get("prompts")
-        rewards = reward_model.get_reward(queries, prompts)
+        rewards = reward_model.get_reward(queries)
         result = {"rewards": rewards}
         logger.info(f"Sent JSON: {result}")
         return JSONResponse(result)

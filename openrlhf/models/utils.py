@@ -5,10 +5,10 @@ import torch.nn.functional as F
 
 
 def compute_approx_kl(
-    log_probs: torch.Tensor,
-    log_probs_base: torch.Tensor,
-    action_mask: Optional[torch.Tensor] = None,
-    use_kl_estimator_k3: bool = False,
+        log_probs: torch.Tensor,
+        log_probs_base: torch.Tensor,
+        action_mask: Optional[torch.Tensor] = None,
+        use_kl_estimator_k3: bool = False,
 ) -> torch.Tensor:
     """
     Compute the approximate KL divergence between two distributions.
@@ -35,12 +35,12 @@ def compute_approx_kl(
 
 
 def compute_reward(
-    r: Union[torch.Tensor, float],
-    kl_coef: float,
-    kl: Union[torch.Tensor, list[torch.Tensor]],
-    action_mask: Optional[torch.Tensor] = None,
-    num_actions: Optional[Union[int, list[int]]] = None,
-    reward_clip_range: Tuple[float, float] = None,
+        r: Union[torch.Tensor, float],
+        kl_coef: float,
+        kl: Union[torch.Tensor, list[torch.Tensor]],
+        action_mask: Optional[torch.Tensor] = None,
+        num_actions: Optional[Union[int, list[int]]] = None,
+        reward_clip_range: Tuple[float, float] = None,
 ) -> Union[torch.Tensor, list[torch.Tensor]]:
     if kl_coef <= 0.0:
         kl_coef = 0.0
@@ -74,22 +74,46 @@ def compute_reward(
     return reward
 
 
-def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    # https://github.com/OpenRLHF/OpenRLHF/pull/718#issuecomment-2641081881
-    if logits.dtype in [torch.float32, torch.float64]:
-        logits_labels = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
-        logsumexp_values = torch.stack(
-            [torch.logsumexp(l, dim=-1) for l in logits]  # loop to reduce peak mem consumption
-        )
-        log_probs_labels = logits_labels - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
+def expand_clip_reward(
+        r: Union[torch.Tensor, float],
+        kl: Union[torch.Tensor, list[torch.Tensor]],
+        action_mask: Optional[torch.Tensor] = None,
+        num_actions: Optional[Union[int, list[int]]] = None,
+        reward_clip_range: Tuple[float, float] = None,
+):
+    if reward_clip_range:
+        r = r.clamp(min=reward_clip_range[0], max=reward_clip_range[1])
+
+    if action_mask is not None:
+        # The following code is equivalent to:
+        #
+        # last_reward = torch.zeros_like(kl)
+        # for i in range(last_reward.size(0)):
+        #     for t in reversed(range(last_reward.size(1))):
+        #         if action_mask[i][t] > 0.5:
+        #             last_reward[i][t] = r[i]
+        #             break
+        #
+        # eos_indices = action_mask.size(1) - 1 - action_mask.long().fliplr().argmax(dim=1, keepdim=True)
+        # last_reward = torch.zeros_like(kl).scatter_(dim=1, index=eos_indices, src=r.unsqueeze(1).to(kl.dtype))
+
+        return r.unsqueeze(1).expand(-1, kl.size(1)).to(kl.dtype)  # @Fangkai: keey the same shape as kl and advantage to avoid padding problem.
     else:
-        log_probs_labels = []
-        for row_logits, row_labels in zip(logits, labels):  # loop to reduce peak mem consumption
-            row_log_probs = F.log_softmax(row_logits, dim=-1)
-            row_log_probs_labels = row_log_probs.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
-            log_probs_labels.append(row_log_probs_labels)
-        log_probs_labels = torch.stack(log_probs_labels)
-    return log_probs_labels
+        # @Fangkai: This should be used for packing samples, where all rewards are packed together and `num_actions` is a list to indicate
+        #  the number of actions in each sample.
+        reward = []
+        for i, (kl_seg, action_len) in enumerate(zip(kl, num_actions)):
+            kl_reward = torch.zeros_like(kl_seg)
+            kl_reward[action_len - 1] += r[i]
+            reward.append(kl_reward)
+
+    return reward
+
+
+def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    log_probs = F.log_softmax(logits, dim=-1)
+    log_probs_labels = log_probs.gather(dim=-1, index=labels.unsqueeze(-1))
+    return log_probs_labels.squeeze(-1)
 
 
 def masked_mean(tensor: torch.Tensor, mask: Optional[torch.Tensor], dim: int = None) -> torch.Tensor:
@@ -102,8 +126,26 @@ def masked_normalize(tensor: torch.Tensor, mask: torch.Tensor, dim: int = 1, eps
     tensor = tensor * mask
     mean = masked_mean(tensor, mask, dim=dim)
     mean_centered = tensor - mean
-    var = masked_mean(mean_centered**2, mask, dim=dim)
+    var = masked_mean(mean_centered ** 2, mask, dim=dim)
     return mean_centered * var.clamp(min=eps).rsqrt()
+
+
+def safe_masked_mean(tensor: torch.Tensor, mask: Optional[torch.Tensor], dim: int = None, keepdim: bool = False) -> torch.Tensor:
+    if mask is None:
+        return tensor.mean(axis=dim, keepdim=keepdim)
+    count = mask.sum(axis=dim, keepdim=keepdim).float()
+    count = count.clamp(min=1)
+    return (tensor * mask).sum(axis=dim, keepdim=keepdim) / count
+
+
+def safe_masked_normalize(tensor: torch.Tensor, mask: torch.Tensor, dim: int = 1, eps: float = 1e-8) -> torch.Tensor:
+    tensor = tensor * mask
+    mean = safe_masked_mean(tensor, mask, dim=dim, keepdim=True)
+    mean_centered = tensor - mean
+    var = safe_masked_mean(mean_centered ** 2, mask, dim=dim, keepdim=True)
+    masked_std = mean_centered / (var.clamp(min=eps).sqrt() + eps)
+    masked_std = torch.where(mask, masked_std, torch.zeros_like(masked_std))
+    return masked_std
 
 
 # Reset positions for packed samples
@@ -127,6 +169,6 @@ def unpacking_samples(values: torch.Tensor, packed_seqlens: list[int]):
     unpacked_values = []
     offset = 0
     for seqlen in packed_seqlens:
-        unpacked_values.append(values[offset : offset + seqlen])
+        unpacked_values.append(values[offset: offset + seqlen])
         offset += seqlen
     return unpacked_values

@@ -34,6 +34,7 @@ class BufferItem:
     attention_mask: Optional[torch.LongTensor]
     action_mask: Optional[torch.BoolTensor]
     info: Optional[dict]
+    ref_action_log_probs: Optional[torch.Tensor]
 
 
 def split_experience_batch(experience: Experience) -> List[BufferItem]:
@@ -47,6 +48,7 @@ def split_experience_batch(experience: Experience) -> List[BufferItem]:
         "advantages",
         "attention_mask",
         "action_mask",
+        "ref_action_log_probs",
     )
     for key in keys:
         value = getattr(experience, key)
@@ -97,6 +99,7 @@ def make_experience_batch(items: List[BufferItem], packing_samples=False) -> Exp
         "advantages",
         "attention_mask",
         "action_mask",
+        "ref_action_log_probs",
     )
     for key in keys:
         vals = [getattr(item, key) for item in items]
@@ -115,7 +118,7 @@ def make_experience_batch(items: List[BufferItem], packing_samples=False) -> Exp
 
 def remove_padding_in_sequences(items):
     for item in items:
-        seq, act_log_prob, value, ret, adv, att_mask, act_mask = (
+        seq, act_log_prob, value, ret, adv, att_mask, act_mask, ref_act_log_prob = (
             item.sequences,
             item.action_log_probs,
             item.values,
@@ -123,6 +126,7 @@ def remove_padding_in_sequences(items):
             item.advantages,
             item.attention_mask,
             item.action_mask,
+            item.ref_action_log_probs,
         )
         right_pad = (1 - act_mask.long()).sum()
         right_pad = None if right_pad == 0 else -right_pad
@@ -137,6 +141,7 @@ def remove_padding_in_sequences(items):
             item.advantages,
             item.attention_mask,
             item.action_mask,
+            item.ref_action_log_probs,
         ) = (
             seq[left_pad:right_pad],
             act_log_prob[:right_pad],
@@ -145,6 +150,7 @@ def remove_padding_in_sequences(items):
             adv[:right_pad],
             att_mask[left_pad:right_pad],
             act_mask[:right_pad],
+            ref_act_log_prob[:right_pad] if item.ref_action_log_probs is not None else None,
         )
     return items
 
